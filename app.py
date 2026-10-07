@@ -6,7 +6,8 @@ import hashlib
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,9 +19,10 @@ DEFAULT_DB = ROOT / "public_procurement.db"
 
 
 class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, details: dict[str, Any] | None = None):
         super().__init__(message)
         self.status = status
+        self.details = details
 
 
 def utcnow() -> str:
@@ -55,9 +57,20 @@ def canonical_hash(value: Any) -> str:
 
 
 class ProcurementService:
-    def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
+    def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB,
+                 clock: Any = None, auto_sweep: bool = True):
         self.db_path = str(db_path)
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._init_schema()
+        self.recover()
+        self._sweep_stop = threading.Event()
+        self._sweep_thread: threading.Thread | None = None
+        if auto_sweep:
+            self._sweep_thread = threading.Thread(target=self._sweep_loop, name="auction-sweeper", daemon=True)
+            self._sweep_thread.start()
+
+    def now(self) -> datetime:
+        return self.clock()
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -164,6 +177,64 @@ class ProcurementService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
+                CREATE TABLE IF NOT EXISTS auctions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL UNIQUE REFERENCES tenders(id),
+                    status TEXT NOT NULL DEFAULT 'active',
+                    started_at TEXT NOT NULL,
+                    ends_at TEXT NOT NULL,
+                    original_ends_at TEXT NOT NULL,
+                    extension_seconds INTEGER NOT NULL,
+                    extension_window_seconds INTEGER NOT NULL,
+                    extension_count INTEGER NOT NULL DEFAULT 0,
+                    ranking_epoch INTEGER NOT NULL DEFAULT 0,
+                    quote_seq INTEGER NOT NULL DEFAULT 0,
+                    event_seq INTEGER NOT NULL DEFAULT 0,
+                    initial_lowest_price REAL,
+                    current_lowest_price REAL,
+                    current_lead_bid_id INTEGER,
+                    close_snapshot TEXT,
+                    snapshot_hash TEXT,
+                    created_by TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS auction_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    auction_id INTEGER NOT NULL REFERENCES auctions(id),
+                    bid_id INTEGER NOT NULL REFERENCES bids(id),
+                    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    base_version INTEGER NOT NULL,
+                    base_price REAL NOT NULL,
+                    best_price REAL,
+                    quote_count INTEGER NOT NULL DEFAULT 0,
+                    accepted_version INTEGER,
+                    UNIQUE(auction_id,bid_id)
+                );
+                CREATE TABLE IF NOT EXISTS auction_quotes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    auction_id INTEGER NOT NULL REFERENCES auctions(id),
+                    bid_id INTEGER NOT NULL REFERENCES bids(id),
+                    seq INTEGER NOT NULL,
+                    price REAL NOT NULL,
+                    prior_lowest_price REAL,
+                    new_lowest_price REAL NOT NULL,
+                    client_token TEXT NOT NULL,
+                    ranking_epoch INTEGER NOT NULL,
+                    extended INTEGER NOT NULL DEFAULT 0,
+                    submitted_by TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    UNIQUE(auction_id,client_token)
+                );
+                CREATE TABLE IF NOT EXISTS auction_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    auction_id INTEGER NOT NULL REFERENCES auctions(id),
+                    seq INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(auction_id,seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_quotes_auction ON auction_quotes(auction_id,seq);
+                CREATE INDEX IF NOT EXISTS idx_events_auction ON auction_events(auction_id,seq);
                 """
             )
 
@@ -376,6 +447,8 @@ class ProcurementService:
             tender = self._tender(conn, bid["tender_id"])
             if tender["status"] not in {"opened", "reevaluation"} or tender["evaluations_locked"]:
                 raise DomainError("当前项目不能评分", 409)
+            if conn.execute("SELECT 1 FROM auctions WHERE tender_id=?", (tender["id"],)).fetchone():
+                raise DomainError("反向竞价名册已冻结，不能再评分", 409)
             if bid["status"] not in {"opened", "qualified"}:
                 raise DomainError("该投标不能评分", 409)
             conflict = conn.execute(
@@ -432,6 +505,8 @@ class ProcurementService:
                 raise DomainError("投标已变化，请刷新后重试", 409)
             if bid["status"] not in {"opened", "qualified"}:
                 raise DomainError("当前投标不能废标", 409)
+            if conn.execute("SELECT 1 FROM auctions WHERE tender_id=?", (bid["tender_id"],)).fetchone():
+                raise DomainError("反向竞价名册已冻结，不能废标", 409)
             conn.execute("UPDATE bids SET status='disqualified',version=version+1 WHERE id=?", (bid_id,))
             self._audit(conn, bid["tender_id"], actor, "bid.disqualified", {"bid_id": bid_id, "reason": reason.strip()})
             return dict(conn.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone())
@@ -507,6 +582,8 @@ class ProcurementService:
                 tender = self._tender(conn, complaint["tender_id"])
                 if tender["status"] in {"awarded", "cancelled"}:
                     raise DomainError("已结束项目不能重新评审", 409)
+                if self._has_active_auction(conn, tender["id"]):
+                    raise DomainError("反向竞价进行中，不能重新评审", 409)
                 conn.execute(
                     "UPDATE tenders SET status='reevaluation',evaluation_round=evaluation_round+1,evaluations_locked=0,version=version+1,updated_at=? WHERE id=?",
                     (utcnow(), tender["id"]),
@@ -527,6 +604,32 @@ class ProcurementService:
             open_complaint = conn.execute("SELECT COUNT(*) AS c FROM complaints WHERE tender_id=? AND status='open'", (tender_id,)).fetchone()["c"]
             if open_complaint:
                 raise DomainError("存在未处理投诉，不能授标", 409)
+            auction = conn.execute("SELECT * FROM auctions WHERE tender_id=?", (tender_id,)).fetchone()
+            if auction:
+                if auction["status"] != "closed":
+                    raise DomainError("反向竞价尚未结束，不能授标", 409)
+                snapshot = json.loads(auction["close_snapshot"])
+                if canonical_hash(snapshot) != auction["snapshot_hash"]:
+                    raise DomainError("竞价成交快照校验失败，不能授标", 409)
+                ranking = snapshot["ranking"]
+                if not ranking:
+                    raise DomainError("没有可授标的有效投标", 409)
+                winner = snapshot["winner"]
+                award_snapshot = {
+                    "tender_id": tender_id, "round": tender["evaluation_round"],
+                    "source": "reverse_auction", "auction_id": auction["id"],
+                    "ranking": ranking, "winner": winner,
+                    "auction_snapshot_hash": auction["snapshot_hash"],
+                    "awarded_by": actor, "awarded_at": utcnow(),
+                }
+                conn.execute(
+                    "UPDATE tenders SET status='awarded',awarded_bid_id=?,award_snapshot=?,evaluations_locked=1,version=version+1,updated_at=? WHERE id=? AND version=?",
+                    (winner["bid_id"], json.dumps(award_snapshot, ensure_ascii=False), utcnow(), tender_id, expected_version),
+                )
+                conn.execute("UPDATE bids SET status='awarded',version=version+1 WHERE id=?", (winner["bid_id"],))
+                self._audit(conn, tender_id, actor, "tender.awarded",
+                            {"winner": winner, "ranking": ranking, "source": "reverse_auction", "auction_id": auction["id"]})
+                return {"tender": dict(self._tender(conn, tender_id)), "award": award_snapshot}
             bids = conn.execute("SELECT * FROM bids WHERE tender_id=? AND status IN ('opened','qualified')", (tender_id,)).fetchall()
             criteria = json.loads(tender["criteria"])
             expected_criteria = {c["name"] for c in criteria}
@@ -556,6 +659,399 @@ class ProcurementService:
             self._audit(conn, tender_id, actor, "tender.awarded", {"winner": winner, "ranking": ranking})
             return {"tender": dict(self._tender(conn, tender_id)), "award": snapshot}
 
+    def _has_active_auction(self, conn: sqlite3.Connection, tender_id: int) -> sqlite3.Row | None:
+        return conn.execute("SELECT * FROM auctions WHERE tender_id=? AND status='active'", (tender_id,)).fetchone()
+
+    def _append_event(self, conn: sqlite3.Connection, auction_id: int, event_type: str,
+                      payload: dict[str, Any], created_at: str | None = None) -> None:
+        row = conn.execute("SELECT event_seq FROM auctions WHERE id=?", (auction_id,)).fetchone()
+        seq = row["event_seq"] + 1
+        conn.execute(
+            "INSERT INTO auction_events(auction_id,seq,event_type,payload,created_at) VALUES(?,?,?,?,?)",
+            (auction_id, seq, event_type, json.dumps(payload, ensure_ascii=False, sort_keys=True), created_at or utcnow()),
+        )
+        conn.execute("UPDATE auctions SET event_seq=? WHERE id=?", (seq, auction_id))
+
+    def start_auction(self, actor: str, role: str, tender_id: int, duration_minutes: int = 30,
+                      extension_window_seconds: int = 120, extension_seconds: int = 120) -> dict[str, Any]:
+        """开标评审后启动限时反向竞价；准入名册在此刻冻结。"""
+        actor = clean_actor(actor)
+        require_role(role, {"procurement"}, "启动反向竞价")
+        try:
+            duration_minutes = int(duration_minutes)
+            extension_window_seconds = int(extension_window_seconds)
+            extension_seconds = int(extension_seconds)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("竞价时长参数必须是整数") from exc
+        if duration_minutes <= 0 or extension_window_seconds <= 0 or extension_seconds <= 0:
+            raise DomainError("竞价时长参数必须大于0")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["status"] not in {"opened", "reevaluation"}:
+                raise DomainError("只有已开标的项目可以启动反向竞价", 409)
+            if conn.execute("SELECT 1 FROM auctions WHERE tender_id=?", (tender_id,)).fetchone():
+                raise DomainError("该项目的反向竞价已存在，不能重复启动", 409)
+            if conn.execute("SELECT COUNT(*) AS c FROM complaints WHERE tender_id=? AND status='open'", (tender_id,)).fetchone()["c"]:
+                raise DomainError("存在未处理投诉，不能启动反向竞价", 409)
+            bids = conn.execute(
+                """SELECT b.* FROM bids b WHERE b.tender_id=? AND b.status IN ('opened','qualified')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conflicts c
+                       WHERE c.tender_id=b.tender_id AND (c.vendor_id=b.vendor_id OR c.vendor_id IS NULL)
+                   ) ORDER BY b.id""",
+                (tender_id,),
+            ).fetchall()
+            if not bids:
+                raise DomainError("没有符合准入条件（已开标、未废标、无利益冲突）的供应商", 409)
+            criteria = json.loads(tender["criteria"])
+            expected_criteria = {c["name"] for c in criteria}
+            for bid in bids:
+                rows = conn.execute(
+                    "SELECT criterion,AVG(score) AS score FROM evaluations WHERE bid_id=? AND evaluation_round=? GROUP BY criterion",
+                    (bid["id"], tender["evaluation_round"]),
+                ).fetchall()
+                if {r["criterion"] for r in rows} != expected_criteria:
+                    raise DomainError("准入供应商尚未完成评审计分: 投标 %s" % bid["id"], 409)
+            started = self.now()
+            ends = started + timedelta(minutes=duration_minutes)
+            started_text = started.isoformat(timespec="seconds")
+            ends_text = ends.isoformat(timespec="seconds")
+            cur = conn.execute(
+                """INSERT INTO auctions(tender_id,status,started_at,ends_at,original_ends_at,
+                       extension_seconds,extension_window_seconds,created_by)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (tender_id, "active", started_text, ends_text, ends_text, extension_seconds, extension_window_seconds, actor),
+            )
+            auction_id = cur.lastrowid
+            lowest = None
+            lead_id = None
+            roster = []
+            for bid in bids:
+                conn.execute(
+                    """INSERT INTO auction_entries(auction_id,bid_id,vendor_id,base_version,base_price)
+                       VALUES(?,?,?,?,?)""",
+                    (auction_id, bid["id"], bid["vendor_id"], bid["version"], bid["price"]),
+                )
+                roster.append({"bid_id": bid["id"], "vendor_id": bid["vendor_id"], "base_price": bid["price"], "base_version": bid["version"]})
+                if lowest is None or bid["price"] < lowest or (bid["price"] == lowest and bid["id"] < lead_id):
+                    lowest = bid["price"]
+                    lead_id = bid["id"]
+            conn.execute(
+                "UPDATE auctions SET initial_lowest_price=?,current_lowest_price=?,current_lead_bid_id=? WHERE id=?",
+                (lowest, lowest, lead_id, auction_id),
+            )
+            conn.execute("UPDATE tenders SET version=version+1,updated_at=? WHERE id=?", (started_text, tender_id))
+            self._append_event(conn, auction_id, "auction.started", {
+                "tender_id": tender_id, "started_at": started_text, "ends_at": ends_text,
+                "duration_minutes": duration_minutes,
+                "extension_window_seconds": extension_window_seconds,
+                "extension_seconds": extension_seconds,
+                "initial_lowest_price": lowest, "roster": roster,
+            }, created_at=started_text)
+            self._audit(conn, tender_id, actor, "auction.started",
+                        {"auction_id": auction_id, "ends_at": ends_text, "entrants": len(roster), "initial_lowest_price": lowest})
+            return self._auction_payload(conn, auction_id, actor, role)
+
+    def submit_auction_quote(self, actor: str, role: str, auction_id: int, bid_id: int,
+                             price: Any, expected_version: int, client_token: str) -> dict[str, Any]:
+        """提交一轮限时降价；严格低于当前最低价，按投标版本乐观校验，令牌幂等。"""
+        actor = clean_actor(actor)
+        require_role(role, {"vendor"}, "提交竞价报价")
+        token = (client_token or "").strip()
+        if not token:
+            raise DomainError("缺少 client_token，重复提交将无法识别", 400)
+        try:
+            price = float(price)
+            expected_version = int(expected_version)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("报价和投标版本必须是数值") from exc
+        if price <= 0:
+            raise DomainError("报价必须大于0")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            auction = conn.execute("SELECT * FROM auctions WHERE id=?", (auction_id,)).fetchone()
+            if not auction:
+                raise DomainError("反向竞价不存在", 404)
+            # 幂等重放：同一令牌直接返回原结果，不再次加时
+            replay = conn.execute(
+                "SELECT * FROM auction_quotes WHERE auction_id=? AND client_token=?",
+                (auction_id, token),
+            ).fetchone()
+            if replay:
+                return {"accepted": True, "replayed": True, "quote": self._quote_dict(conn, replay),
+                        "auction": self._auction_payload(conn, auction_id, actor, role)}
+            if auction["status"] != "active":
+                raise DomainError("反向竞价已结束", 409, self._conflict_detail(auction, bid_id, price))
+            now = self.now()
+            ends = parse_time(auction["ends_at"])
+            if now >= ends:
+                self._close_auction(conn, auction, now.isoformat(timespec="seconds"), recovered=True)
+                conn.commit()  # 随后抛 DomainError 会触发 with 回滚，需先提交补收盘
+                fresh = conn.execute("SELECT * FROM auctions WHERE id=?", (auction_id,)).fetchone()
+                raise DomainError("反向竞价已结束", 409, self._conflict_detail(fresh, bid_id, price))
+            entry = conn.execute(
+                "SELECT * FROM auction_entries WHERE auction_id=? AND bid_id=?", (auction_id, bid_id),
+            ).fetchone()
+            if not entry:
+                raise DomainError("该投标不在竞价准入名册中", 403, self._conflict_detail(auction, bid_id, price))
+            bid = conn.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone()
+            if bid["submitted_by"] != actor:
+                raise DomainError("只能为自己的投标报价", 403, self._conflict_detail(auction, bid_id, price))
+            if bid["version"] != expected_version:
+                # 并发窗口：版本已被另一笔报价推进，保留输入并回传当前最低价
+                raise DomainError("投标版本已变化，请基于当前最低价重新报价", 409,
+                                  self._conflict_detail(auction, bid_id, price))
+            current_lowest = auction["current_lowest_price"]
+            if price >= current_lowest:
+                raise DomainError("报价必须低于当前最低价", 409, self._conflict_detail(auction, bid_id, price))
+            remaining = (ends - now).total_seconds()
+            extended = 1 if remaining <= auction["extension_window_seconds"] else 0
+            new_ends = ends + timedelta(seconds=auction["extension_seconds"]) if extended else ends
+            seq = auction["quote_seq"] + 1
+            epoch = auction["ranking_epoch"] + 1
+            now_text = now.isoformat(timespec="seconds")
+            new_ends_text = new_ends.isoformat(timespec="seconds")
+            cur = conn.execute(
+                """INSERT INTO auction_quotes(auction_id,bid_id,seq,price,prior_lowest_price,new_lowest_price,
+                       client_token,ranking_epoch,extended,submitted_by,received_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (auction_id, bid_id, seq, price, current_lowest, price, token, epoch, extended, actor, now_text),
+            )
+            conn.execute(
+                """UPDATE auction_entries SET best_price=?,quote_count=quote_count+1,accepted_version=?
+                   WHERE id=?""",
+                (price, bid["version"] + 1, entry["id"]),
+            )
+            conn.execute(
+                "UPDATE bids SET price=?,version=version+1 WHERE id=? AND version=?",
+                (price, bid_id, expected_version),
+            )
+            conn.execute(
+                """UPDATE auctions SET current_lowest_price=?,current_lead_bid_id=?,ranking_epoch=?,quote_seq=?,
+                       ends_at=?,extension_count=extension_count+? WHERE id=?""",
+                (price, bid_id, epoch, seq, new_ends_text, extended, auction_id),
+            )
+            self._append_event(conn, auction_id, "quote.accepted", {
+                "seq": seq, "bid_id": bid_id, "vendor_id": bid["vendor_id"], "price": price,
+                "prior_lowest_price": current_lowest, "ranking_epoch": epoch,
+                "extended": bool(extended), "new_ends_at": new_ends_text if extended else None,
+                "remaining_seconds": round(remaining, 1), "received_at": now_text,
+            }, created_at=now_text)
+            self._audit(conn, auction["tender_id"], actor, "auction.quote",
+                        {"auction_id": auction_id, "seq": seq, "price": price, "extended": bool(extended)})
+            quote = conn.execute("SELECT * FROM auction_quotes WHERE id=?", (cur.lastrowid,)).fetchone()
+            return {"accepted": True, "replayed": False, "quote": self._quote_dict(conn, quote),
+                    "auction": self._auction_payload(conn, auction_id, actor, role)}
+
+    @staticmethod
+    def _conflict_detail(auction: sqlite3.Row, bid_id: int, entered_price: float) -> dict[str, Any]:
+        """竞价失败时保留供应商已输入的价格并回传当前最低价，便于立即改价。"""
+        return {
+            "auction_id": auction["id"], "bid_id": bid_id, "entered_price": entered_price,
+            "current_lowest_price": auction["current_lowest_price"],
+            "current_lead_bid_id": auction["current_lead_bid_id"],
+            "ends_at": auction["ends_at"], "ranking_epoch": auction["ranking_epoch"],
+            "server_time": utcnow(),
+        }
+
+    @staticmethod
+    def _quote_dict(conn: sqlite3.Connection, quote: sqlite3.Row) -> dict[str, Any]:
+        vendor = conn.execute("SELECT vendor_id FROM bids WHERE id=?", (quote["bid_id"],)).fetchone()
+        return {
+            "id": quote["id"], "seq": quote["seq"], "bid_id": quote["bid_id"],
+            "vendor_id": vendor["vendor_id"] if vendor else None,
+            "price": quote["price"], "prior_lowest_price": quote["prior_lowest_price"],
+            "new_lowest_price": quote["new_lowest_price"], "ranking_epoch": quote["ranking_epoch"],
+            "extended": bool(quote["extended"]), "received_at": quote["received_at"],
+        }
+
+    def _compute_ranking(self, conn: sqlite3.Connection, tender: sqlite3.Row,
+                         final_prices: dict[int, float]) -> list[dict[str, Any]]:
+        """用最终竞价价格重算价格分；最低价一旦更新，旧价格分排名即作废。
+
+        竞价采用最低价基准法：价格分 = 最低有效价 / 己方最终价 × 100，
+        每一次最低价更新都会改变相对价格分；非价格分沿用已锁定的评审打分。
+        """
+        criteria = json.loads(tender["criteria"])
+        lowest = min(final_prices.values())
+        ranking = []
+        for bid_id, final_price in final_prices.items():
+            rows = conn.execute(
+                "SELECT criterion,AVG(score) AS score FROM evaluations WHERE bid_id=? AND evaluation_round=? GROUP BY criterion",
+                (bid_id, tender["evaluation_round"]),
+            ).fetchall()
+            scores = {row["criterion"]: row["score"] for row in rows}
+            for criterion in criteria:
+                if criterion["kind"] == "cost":
+                    scores[criterion["name"]] = min(100.0, lowest / final_price * 100) if final_price > 0 else 0.0
+            weighted = sum(scores[c["name"]] * c["weight"] / 100 for c in criteria)
+            ranking.append({"bid_id": bid_id, "price": final_price, "score": round(weighted, 2)})
+        ranking.sort(key=lambda item: (-item["score"], item["price"], item["bid_id"]))
+        for index, item in enumerate(ranking, start=1):
+            item["rank"] = index
+        return ranking
+
+    def _close_auction(self, conn: sqlite3.Connection, auction: sqlite3.Row, closed_at: str,
+                       recovered: bool = False) -> dict[str, Any]:
+        """冻结成交快照：最终价重算排名，快照内容带哈希，状态翻转幂等。"""
+        if auction["status"] == "closed":
+            return json.loads(auction["close_snapshot"])
+        tender = self._tender(conn, auction["tender_id"])
+        entries = conn.execute("SELECT * FROM auction_entries WHERE auction_id=? ORDER BY bid_id", (auction["id"],)).fetchall()
+        final_prices = {e["bid_id"]: (e["best_price"] if e["best_price"] is not None else e["base_price"]) for e in entries}
+        ranking = self._compute_ranking(conn, tender, final_prices)
+        vendor_rows = conn.execute("SELECT id,vendor_id FROM bids WHERE tender_id=?", (tender["id"],)).fetchall()
+        vendor_map = {bid["id"]: bid["vendor_id"] for bid in vendor_rows}
+        for item in ranking:
+            item["vendor_id"] = vendor_map.get(item["bid_id"])
+        winner = ranking[0] if ranking else None
+        snapshot = {
+            "auction_id": auction["id"], "tender_id": tender["id"],
+            "evaluation_round": tender["evaluation_round"],
+            "started_at": auction["started_at"], "ends_at": auction["ends_at"],
+            "closed_at": closed_at, "recovered": recovered,
+            "initial_lowest_price": auction["initial_lowest_price"],
+            "final_lowest_price": auction["current_lowest_price"],
+            "extension_count": auction["extension_count"], "ranking_epoch": auction["ranking_epoch"],
+            "ranking": ranking, "winner": winner,
+            "entries": [{
+                "bid_id": e["bid_id"], "vendor_id": e["vendor_id"],
+                "base_price": e["base_price"], "final_price": final_prices[e["bid_id"]],
+                "quote_count": e["quote_count"],
+            } for e in entries],
+        }
+        snapshot_text = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        digest = canonical_hash(snapshot)
+        conn.execute(
+            "UPDATE auctions SET status='closed',close_snapshot=?,snapshot_hash=? WHERE id=?",
+            (snapshot_text, digest, auction["id"]),
+        )
+        conn.execute("UPDATE tenders SET version=version+1,updated_at=? WHERE id=?", (closed_at, tender["id"]))
+        self._append_event(conn, auction["id"], "auction.closed", {
+            "closed_at": closed_at, "recovered": recovered,
+            "final_lowest_price": auction["current_lowest_price"],
+            "winner": winner, "extension_count": auction["extension_count"],
+            "snapshot_hash": digest,
+        }, created_at=closed_at)
+        self._audit(conn, tender["id"], "system" if recovered else "auction", "auction.closed",
+                    {"auction_id": auction["id"], "winner": winner, "recovered": recovered})
+        return snapshot
+
+    def close_auction(self, actor: str, role: str, auction_id: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"procurement", "supervisor"}, "结束反向竞价")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            auction = conn.execute("SELECT * FROM auctions WHERE id=?", (auction_id,)).fetchone()
+            if not auction:
+                raise DomainError("反向竞价不存在", 404)
+            if auction["status"] == "closed":
+                raise DomainError("反向竞价已结束", 409)
+            snapshot = self._close_auction(conn, auction, self.now().isoformat(timespec="seconds"))
+            return self._auction_payload(conn, auction_id, actor, role, snapshot=snapshot)
+
+    def sweep_due(self) -> list[int]:
+        """把所有到时未收盘的竞价补收盘（崩溃恢复/后台清扫共用）。"""
+        closed_ids = []
+        now = self.now()
+        with self.connect() as conn:
+            due = conn.execute("SELECT * FROM auctions WHERE status='active' ORDER BY id").fetchall()
+            due_ids = [a["id"] for a in due if now >= parse_time(a["ends_at"])]
+        for auction_id in due_ids:
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                fresh = conn.execute("SELECT * FROM auctions WHERE id=?", (auction_id,)).fetchone()
+                if fresh["status"] == "active":
+                    self._close_auction(conn, fresh, self.now().isoformat(timespec="seconds"), recovered=True)
+                    closed_ids.append(auction_id)
+        return closed_ids
+
+    def recover(self) -> dict[str, Any]:
+        """服务启动时从数据库恢复计时：结束时间以落库 ends_at 为准，到时则补收盘。"""
+        with self.connect() as conn:
+            active = conn.execute("SELECT id,ends_at,event_seq,quote_seq FROM auctions WHERE status='active' ORDER BY id").fetchall()
+        closed = self.sweep_due()
+        return {"active": [dict(a) for a in active], "closed_on_recovery": closed}
+
+    def _sweep_loop(self) -> None:
+        while not self._sweep_stop.wait(0.5):
+            try:
+                self.sweep_due()
+            except Exception:  # 清扫失败不能拖垮服务，下一拍继续
+                pass
+
+    def shutdown(self) -> None:
+        self._sweep_stop.set()
+        if self._sweep_thread:
+            self._sweep_thread.join(timeout=2)
+
+    def _auction_payload(self, conn: sqlite3.Connection, auction_id: int, actor: str, role: str,
+                         snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+        auction = conn.execute("SELECT * FROM auctions WHERE id=?", (auction_id,)).fetchone()
+        if not auction:
+            raise DomainError("反向竞价不存在", 404)
+        privileged = role in {"procurement", "supervisor", "auditor"}
+        my_bid_id = None
+        if role == "vendor":
+            row = conn.execute(
+                "SELECT ae.bid_id FROM auction_entries ae JOIN bids b ON b.id=ae.bid_id "
+                "WHERE ae.auction_id=? AND b.submitted_by=?",
+                (auction_id, actor),
+            ).fetchone()
+            my_bid_id = row["bid_id"] if row else None
+        entries = []
+        for e in conn.execute(
+            """SELECT ae.*,b.submitted_by FROM auction_entries ae
+               JOIN bids b ON b.id=ae.bid_id WHERE ae.auction_id=? ORDER BY ae.bid_id""",
+            (auction_id,),
+        ).fetchall():
+            is_mine = role == "vendor" and e["submitted_by"] == actor
+            final_price = e["best_price"] if e["best_price"] is not None else e["base_price"]
+            if privileged or is_mine:
+                entries.append({
+                    "bid_id": e["bid_id"], "vendor_id": e["vendor_id"], "submitted_by": e["submitted_by"],
+                    "base_price": e["base_price"], "best_price": e["best_price"],
+                    "final_price": final_price, "quote_count": e["quote_count"],
+                    "base_version": e["base_version"], "is_mine": is_mine,
+                    "is_lead": auction["current_lead_bid_id"] == e["bid_id"],
+                })
+            else:
+                entries.append({"quote_count": e["quote_count"], "is_mine": False,
+                                "is_lead": auction["current_lead_bid_id"] == e["bid_id"]})
+        events = []
+        for ev in conn.execute("SELECT * FROM auction_events WHERE auction_id=? ORDER BY seq", (auction_id,)).fetchall():
+            payload = json.loads(ev["payload"])
+            if not privileged and ev["event_type"] == "quote.accepted" and payload.get("bid_id") != my_bid_id:
+                payload = {k: v for k, v in payload.items()
+                           if k in {"seq", "price", "extended", "new_ends_at", "remaining_seconds", "received_at"}}
+            elif not privileged and ev["event_type"] == "auction.started":
+                payload = {k: v for k, v in payload.items() if k != "roster"}
+            events.append({"seq": ev["seq"], "type": ev["event_type"], "payload": payload, "created_at": ev["created_at"]})
+        if snapshot is None and auction["close_snapshot"]:
+            snapshot = json.loads(auction["close_snapshot"])
+        result = {
+            "id": auction["id"], "tender_id": auction["tender_id"], "status": auction["status"],
+            "started_at": auction["started_at"], "ends_at": auction["ends_at"],
+            "original_ends_at": auction["original_ends_at"],
+            "extension_window_seconds": auction["extension_window_seconds"],
+            "extension_seconds": auction["extension_seconds"],
+            "extension_count": auction["extension_count"],
+            "ranking_epoch": auction["ranking_epoch"], "quote_seq": auction["quote_seq"],
+            "initial_lowest_price": auction["initial_lowest_price"],
+            "current_lowest_price": auction["current_lowest_price"],
+            "current_lead_bid_id": auction["current_lead_bid_id"],
+            "entries": entries, "events": events,
+        }
+        if snapshot is not None:
+            result["close_snapshot"] = snapshot
+            result["snapshot_hash"] = auction["snapshot_hash"]
+        return result
+
+    def get_auction(self, actor: str, role: str, auction_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            return self._auction_payload(conn, auction_id, actor, role)
+
     def get_tender(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
         with self.connect() as conn:
             tender = dict(self._tender(conn, tender_id))
@@ -582,7 +1078,11 @@ class ProcurementService:
                 "SELECT id,tender_id,vendor_id,question,answer,status,answered_at FROM clarifications WHERE tender_id=? AND status='published' ORDER BY id",
                 (tender_id,),
             ).fetchall()]
-            return {"tender": tender, "bids": bids, "clarifications": clarifications}
+            auction_row = conn.execute("SELECT id FROM auctions WHERE tender_id=?", (tender_id,)).fetchone()
+            result = {"tender": tender, "bids": bids, "clarifications": clarifications}
+            if auction_row:
+                result["auction"] = self._auction_payload(conn, auction_row["id"], actor, role)
+            return result
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
@@ -614,7 +1114,13 @@ class ProcurementService:
                 ).fetchall()]
             else:
                 bids, complaints = [], []
-        return {"tenders": tenders, "bids": bids, "complaints": complaints, "timeline": timeline, "role": role}
+            auctions = [dict(r) for r in conn.execute(
+                """SELECT id,tender_id,status,started_at,ends_at,extension_count,ranking_epoch,
+                          initial_lowest_price,current_lowest_price,current_lead_bid_id,snapshot_hash
+                   FROM auctions ORDER BY id DESC"""
+            ).fetchall()]
+        return {"tenders": tenders, "bids": bids, "complaints": complaints,
+                "auctions": auctions, "timeline": timeline, "role": role}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -676,12 +1182,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(200, {"status": "ok", "service": "public-procurement"})
             elif path == "/api/state":
                 self._send(200, self.service.state(actor, role))
+            elif path.startswith("/api/auctions/"):
+                self._send(200, self.service.get_auction(actor, role, int(path.split("/")[3])))
             elif path.startswith("/api/tenders/"):
                 self._send(200, self.service.get_tender(actor, role, int(path.split("/")[3])))
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
-            self._send(exc.status, {"error": str(exc)})
+            payload = {"error": str(exc)}
+            if exc.details:
+                payload["details"] = exc.details
+            self._send(exc.status, payload)
         except (ValueError, IndexError) as exc:
             self._send(400, {"error": str(exc)})
 
@@ -716,11 +1227,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.resolve_complaint(actor, role, **data)
             elif path == "/api/tenders/award":
                 result = self.service.award_tender(actor, role, **data)
+            elif path == "/api/auctions":
+                result = self.service.start_auction(actor, role, **data)
+            elif path == "/api/auctions/quote":
+                result = self.service.submit_auction_quote(actor, role, **data)
+            elif path == "/api/auctions/close":
+                result = self.service.close_auction(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
         except DomainError as exc:
-            self._send(exc.status, {"error": str(exc)})
+            payload: dict[str, Any] = {"error": str(exc)}
+            if exc.details:
+                payload["details"] = exc.details
+            self._send(exc.status, payload)
         except (KeyError, TypeError, ValueError) as exc:
             self._send(400, {"error": "请求参数错误: %s" % exc})
         except Exception as exc:
